@@ -17,6 +17,8 @@ Main Features:
 
 Files:
 - app.py .................. Main Streamlit app
+- insights_nlp.py ........ A Streamlit-based system that detects sensor anomalies and correlates them with operator logs.
+
 - generate_data.py ........ Script to generate synthetic sensor + log CSV files
 - sensor_pressure_1month_minute.csv .... Example generated sensor data
 - operator_logs_formatted_1month.csv .... Example generated log data
