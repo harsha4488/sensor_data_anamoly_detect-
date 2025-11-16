@@ -1,0 +1,27 @@
+streamlit==1.32.0
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.4.0
+scipy==1.12.0
+
+# For LSTM Autoencoder (CPU version)
+tensorflow-cpu==2.15.0
+
+# If your environment doesn't support TF 2.15, use:
+# tensorflow==2.15.0
+
+# Standalone keras (in case tensorflow.keras is unavailable)
+keras==2.15.0
+
+# For TF-IDF / ML utils
+joblib==1.3.2
+
+# For ChatGroq
+langchain==0.1.11
+langchain-groq==0.2.0
+
+# Optional: Groq SDK (not required for langchain_groq)
+groq==0.8.0
+
+# Avoid broken dependencies
+protobuf==3.20.*
