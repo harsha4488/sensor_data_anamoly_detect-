@@ -1,23 +1,18 @@
 # app.py
 """
-Streamlit app (single-file):
-- Multi-model anomaly detection (IsolationForest, Z-score, OCSVM, LOF, Elliptic, PCA, IQR, LSTM Autoencoder)
+Streamlit app:
+- Multi-model anomaly detection (IsolationForest, Z-Score, OCSVM, LOF, Elliptic, PCA, IQR, LSTM Autoencoder)
 - Robust TF-IDF log correlation
 - Lightweight log analysis toolkit (timeline, top ngrams, topics via NMF, clustering)
 - Direct Groq LLM chat (optional — paste key in sidebar to enable)
-- Generate abstract summary (LLM if initialized, otherwise local fallback)
-- Highlight anomaly rows in sensor table (red)
-Notes:
-- LSTM autoencoder requires Keras (tensorflow.keras or standalone keras). The app attempts both.
-- If you don't want LSTM, you can ignore Keras / TensorFlow installation.
-- To enable chat/LMM features, install 'langchain_groq' and 'langchain' and paste a valid GROQ key in the sidebar.
-Run:
-    streamlit run app.py
+- Context-aware chat: LLM receives sensor/log/correlation context when answering
+- Generate & download synthetic 1-month minute-level sensor + log CSVs
+- Highlight anomaly rows in the sensor table
 """
-
+import json
+import io
 import os
 import re
-import json
 from typing import List, Optional, Dict, Any
 
 import numpy as np
@@ -25,7 +20,6 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# sklearn
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
@@ -46,21 +40,17 @@ try:
 except Exception:
     _HAS_GROQ = False
 
-# Keras import strategy (try tensorflow.keras then fallback to standalone keras)
-_KERAS_IMPL = None
+# Keras import strategy (LSTM autoencoder optional)
 layers = None
 models = None
 try:
     import tensorflow as tf  # noqa: F401
     from tensorflow.keras import layers, models
-    _KERAS_IMPL = "tf.keras"
 except Exception:
     try:
         import keras  # noqa: F401
         from keras import layers, models  # type: ignore
-        _KERAS_IMPL = "keras"
     except Exception:
-        _KERAS_IMPL = None
         layers = None
         models = None
 
@@ -69,7 +59,7 @@ except Exception:
 # -------------------------
 def simple_tokenize(text: str) -> List[str]:
     text = str(text).lower()
-    toks = re.findall(r"[a-zA-Z]+", text)
+    toks = re.findall(r"[a-zA-Z0-9]+", text)
     return [t for t in toks if len(t) > 1]
 
 def preprocess_text_for_tfidf(texts: List[str]) -> List[str]:
@@ -148,12 +138,10 @@ def detect_anomalies_iqr(df: pd.DataFrame, window=48, factor=1.5) -> pd.Series:
         flags |= (num[col] < lower) | (num[col] > upper)
     return flags
 
-# -------------------------
-# LSTM autoencoder (if available)
-# -------------------------
+# LSTM autoencoder (optional)
 def build_lstm_autoencoder(seq_len:int, nfeat:int):
     if models is None or layers is None:
-        raise RuntimeError("Keras is not available in this environment. Install tensorflow or keras.")
+        raise RuntimeError("Keras/TensorFlow not available.")
     m = models.Sequential([
         layers.Input(shape=(seq_len, nfeat)),
         layers.LSTM(32, return_sequences=True),
@@ -191,7 +179,7 @@ def detect_anomalies_lstm_autoencoder(df: pd.DataFrame, seq_len=24, epochs=5) ->
     return pd.Series(full, index=df.index)
 
 # -------------------------
-# Anomaly signature & robust correlation
+# Signature + robust correlation
 # -------------------------
 def anomaly_signature(df: pd.DataFrame, row_idx:int, top_k:int=3) -> str:
     num = df.select_dtypes(include=[np.number])
@@ -204,17 +192,11 @@ def anomaly_signature(df: pd.DataFrame, row_idx:int, top_k:int=3) -> str:
 
 def correlate_anomalies_with_logs(sensor_df: pd.DataFrame, logs_df: pd.DataFrame,
                                   anomaly_series: pd.Series, window_minutes:int=30, top_matches:int=3) -> List[Dict[str,Any]]:
-    """
-    Robust correlation between anomalies and logs.
-    Uses index->position mapping to avoid get_loc returning slices.
-    """
     results: List[Dict[str,Any]] = []
-
     logs = logs_df.copy()
-    # try to set datetime index if possible
     if "timestamp" in logs.columns:
         try:
-            logs["timestamp"] = pd.to_datetime(logs["timestamp"])
+            logs["timestamp"] = pd.to_datetime(logs["timestamp"], errors="coerce")
             logs = logs.set_index("timestamp").sort_index()
         except Exception:
             pass
@@ -229,8 +211,6 @@ def correlate_anomalies_with_logs(sensor_df: pd.DataFrame, logs_df: pd.DataFrame
         raise ValueError("Logs dataframe must contain a 'log' column.")
 
     logs["_preproc_text"] = preprocess_text_for_tfidf(logs["log"].astype(str).tolist())
-
-    # Build TF-IDF matrix (if text exists)
     corpus_texts = logs["_preproc_text"].fillna("").tolist()
     tfidf = None
     logs_vec = None
@@ -238,18 +218,15 @@ def correlate_anomalies_with_logs(sensor_df: pd.DataFrame, logs_df: pd.DataFrame
         tfidf = TfidfVectorizer(max_features=2000)
         logs_vec = tfidf.fit_transform(corpus_texts)
 
-    # index -> first integer position mapping
     index_to_pos = {}
     for p, idx in enumerate(logs.index):
         if idx not in index_to_pos:
             index_to_pos[idx] = p
 
-    # anomaly integer positions
     anomaly_positions = np.where(anomaly_series)[0]
     sensor_idx = sensor_df.index if isinstance(sensor_df.index, pd.DatetimeIndex) else None
 
     for pos in anomaly_positions:
-        # get timestamp for anomaly if available
         ts = None
         try:
             ts = sensor_df.index[pos] if sensor_idx is not None else None
@@ -259,7 +236,6 @@ def correlate_anomalies_with_logs(sensor_df: pd.DataFrame, logs_df: pd.DataFrame
         signature = anomaly_signature(sensor_df, pos)
         sig_proc = " ".join(simple_tokenize(signature))
 
-        # select logs within window
         if ts is not None and isinstance(logs.index, pd.DatetimeIndex):
             start = ts - pd.Timedelta(minutes=window_minutes)
             end = ts + pd.Timedelta(minutes=window_minutes)
@@ -279,7 +255,6 @@ def correlate_anomalies_with_logs(sensor_df: pd.DataFrame, logs_df: pd.DataFrame
             })
             continue
 
-        # map window log indices to integer positions
         window_positions = []
         for idx in window_logs.index:
             p = index_to_pos.get(idx, None)
@@ -297,17 +272,15 @@ def correlate_anomalies_with_logs(sensor_df: pd.DataFrame, logs_df: pd.DataFrame
                 if score <= 0:
                     continue
                 global_pos = window_positions[r]
-                log_ts = str(logs.index[global_pos])
                 original_text = logs["log"].iloc[global_pos]
                 matches.append({
                     "log_pos": int(global_pos),
                     "log_index": str(logs.index[global_pos]),
-                    "timestamp": log_ts,
+                    "timestamp": str(logs.index[global_pos]),
                     "text": original_text,
                     "score": round(score, 4)
                 })
         else:
-            # fallback token overlap
             sig_set = set(sig_proc.split())
             for idx, row in window_logs.iterrows():
                 txt = row["_preproc_text"]
@@ -341,8 +314,7 @@ the and is to of in for on with at as by this that from or it be are was were ha
 """.split())
 
 def clean_text(text: str) -> str:
-    t = str(text)
-    t = t.lower()
+    t = str(text).lower()
     t = re.sub(r'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}', ' ', t)
     t = re.sub(r'\[\d{1,2}:\d{2}:\d{2}\]', ' ', t)
     t = re.sub(r'[^a-z0-9]', ' ', t)
@@ -378,7 +350,6 @@ def top_ngrams(texts, n=20, ngram_range=(1,1), stopwords=_STOPWORDS):
     return [(terms[i], int(counts[i])) for i in top_idx]
 
 def extract_severity_counts(texts):
-    counters = {}
     counters = {"error":0,"warning":0,"critical":0,"info":0}
     for t in texts:
         tl = t.lower()
@@ -428,7 +399,7 @@ def cluster_logs(texts, n_clusters=4):
     reps = {}
     for c in range(n_clusters):
         sims = (Xn @ cn[c].T).A1 if hasattr(Xn, "A1") else (Xn @ cn[c].T)
-        best = sims.argmax()
+        best = int(sims.argmax())
         reps[c] = best
     return labels, reps
 
@@ -479,7 +450,7 @@ def analyze_logs(logs_df, text_col="log", ts_candidates=("timestamp","time","ts"
     return out
 
 # -------------------------
-# Plot helpers
+# Plot helpers (matplotlib)
 # -------------------------
 def plot_timeline(timeline_series, title="Events over time", figsize=(8,3)):
     fig, ax = plt.subplots(figsize=figsize)
@@ -498,6 +469,7 @@ def plot_top_terms(top_terms, title="Top terms", figsize=(6,3)):
     ax.set_xticks(range(len(terms)))
     ax.set_xticklabels(terms, rotation=45, ha='right')
     ax.set_title(title)
+    fig.tight_layout()
     return fig
 
 # -------------------------
@@ -550,10 +522,87 @@ def llm_abstract_from_results(client, correlation_results: List[Dict[str,Any]]) 
         return str(resp)
     return out
 
-def make_groq_client(groq_key: str, model: str="openai/gpt-oss-20b"):
+def make_groq_client(groq_key: str, model: str="llama3-70b-8192"):
     if not _HAS_GROQ:
-        raise RuntimeError("langchain_groq not installed. Install 'langchain_groq' and 'langchain' to use LLM features.")
+        raise RuntimeError("langchain_groq not installed.")
     return ChatGroq(groq_api_key=groq_key, model=model)
+
+# -------------------------
+# File generation helpers & downloads
+# -------------------------
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.StringIO()
+    df.to_csv(buf, index=True)
+    return buf.getvalue().encode("utf-8")
+
+def json_to_bytes(obj: Any) -> bytes:
+    s = json.dumps(obj, indent=2, default=str)
+    return s.encode("utf-8")
+
+def text_to_bytes(s: str) -> bytes:
+    return s.encode("utf-8")
+
+def correlation_to_dataframe(corr_results: List[Dict[str,Any]]) -> pd.DataFrame:
+    rows = []
+    for r in corr_results:
+        base = {
+            "anomaly_pos": r.get("anomaly_pos"),
+            "anomaly_timestamp": r.get("timestamp"),
+            "signature": r.get("signature")
+        }
+        matches = r.get("matches", [])
+        if not matches:
+            rows.append({**base, **{"match_idx": None, "match_timestamp": None, "match_score": None, "match_text": None}})
+        else:
+            for i, m in enumerate(matches):
+                rows.append({**base, **{
+                    "match_idx": i,
+                    "match_timestamp": m.get("timestamp"),
+                    "match_score": m.get("score"),
+                    "match_text": m.get("text")
+                }})
+    return pd.DataFrame(rows)
+
+def make_1month_sensor_and_logs(start_ts="2025-01-01 00:00:00", days=30,
+                                out_sensor_path="/mnt/data/sensor_pressure_1month_minute.csv",
+                                out_logs_path="/mnt/data/operator_logs_formatted_1month.csv",
+                                seed=123):
+    periods = days * 24 * 60
+    rng = pd.date_range(start=start_ts, periods=periods, freq="T")
+    np.random.seed(seed)
+    pressure = 101.5 + 0.05 * np.sin(np.linspace(0, 20 * np.pi, periods)) + np.random.normal(scale=0.05, size=periods)
+    temperature = 78.2 + 0.02 * np.sin(np.linspace(0, 10 * np.pi, periods)) + np.random.normal(scale=0.03, size=periods)
+    vibration = 0.12 + 0.005 * np.sin(np.linspace(0, 8 * np.pi, periods)) + np.random.normal(scale=0.005, size=periods)
+    anomaly_indices = [10, 11, 670, 671, 3000, 20000]
+    for i in anomaly_indices:
+        if i < periods:
+            pressure[i:i+3] += np.random.uniform(8, 12)
+            temperature[i:i+2] += np.random.uniform(10, 14)
+            vibration[i:i+4] += np.random.uniform(0.4, 0.7)
+    sensor_df = pd.DataFrame({
+        "timestamp": rng,
+        "pressure": np.round(pressure, 3),
+        "temperature": np.round(temperature, 3),
+        "vibration": np.round(vibration, 3)
+    })
+    log_entries = []
+    for i in anomaly_indices:
+        if i < periods:
+            ts1 = rng[i] + pd.Timedelta(seconds=30)
+            ts2 = rng[i] + pd.Timedelta(seconds=90)
+            log_entries.append((ts1, "Minor vibration noise detected near pump A."))
+            log_entries.append((ts2, "Pressure spike observed; operators alerted."))
+    for h in range(0, periods, 60*12):
+        ts = rng[h] + pd.Timedelta(seconds=10)
+        log_entries.append((ts, "Routine check completed. All sensors nominal."))
+    trend_times = [rng[9] + pd.Timedelta(seconds=45), rng[600] + pd.Timedelta(seconds=20)]
+    for t in trend_times:
+        log_entries.append((t, "Noticed rising temperature trend in the section."))
+    log_entries_sorted = sorted(log_entries, key=lambda x: x[0])
+    logs_df = pd.DataFrame(log_entries_sorted, columns=["timestamp", "log"])
+    sensor_df.to_csv(out_sensor_path, index=False)
+    logs_df.to_csv(out_logs_path, index=False)
+    return sensor_df, logs_df, (out_sensor_path, out_logs_path)
 
 # -------------------------
 # Highlight helper
@@ -564,21 +613,80 @@ def highlight_anomalies(df: pd.DataFrame, anomaly_series: pd.Series):
     except Exception:
         mask = pd.Series(False, index=df.index)
     def _row_style(row):
-        if mask.loc[row.name]:
-            return ['background-color: #ffcccc'] * len(row)
-        else:
-            return [''] * len(row)
+        try:
+            if mask.loc[row.name]:
+                return ['background-color: #ffcccc'] * len(row)
+        except Exception:
+            pass
+        return [''] * len(row)
     return df.style.apply(_row_style, axis=1)
+
+# -------------------------
+# LLM prompt builder (context-aware)
+# -------------------------
+def build_insightful_chat_prompt(
+    user_msg: str,
+    sensor_df=None,
+    logs_df=None,
+    correlation_results=None,
+    log_analysis=None,
+) -> str:
+    context_parts = []
+    if sensor_df is not None:
+        try:
+            context_parts.append(
+                f"Sensor dataframe shape: {sensor_df.shape}, columns: {list(sensor_df.columns)}"
+            )
+            try:
+                sample_head = sensor_df.head(3).reset_index().to_dict(orient="records")
+                context_parts.append("Sensor sample rows: " + json.dumps(sample_head, default=str))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    if log_analysis is not None:
+        try:
+            summary = log_analysis.get("local_summary", "")
+            sev = log_analysis.get("severity_counts", {})
+            top_terms = log_analysis.get("top_unigrams", [])[:8]
+            context_parts.append("Log analysis summary:")
+            if summary:
+                context_parts.append(summary)
+            if sev:
+                context_parts.append(f"Log severity counts: {sev}")
+            if top_terms:
+                context_parts.append("Top log terms: " + ", ".join([f"{w}({c})" for w, c in top_terms]))
+        except Exception:
+            pass
+    if correlation_results:
+        try:
+            sample_corr = correlation_results[:5]
+            corr_json = json.dumps(sample_corr, indent=2, default=str)
+            corr_json = corr_json[:4000]
+            context_parts.append("Sample anomaly–log correlations (truncated JSON):\n" + corr_json)
+        except Exception:
+            pass
+    if not context_parts:
+        context_text = "No sensor or log data is loaded in the dashboard. Answer the user's question generally."
+    else:
+        context_text = "\n\n".join(context_parts)
+    prompt = (
+        "You are an assistant embedded in a Streamlit dashboard for industrial sensor anomaly detection.\n"
+        "Use the CONTEXT to answer the user's question succinctly and concretely. Cite sample values or timestamps if helpful.\n\n"
+        f"CONTEXT:\n{context_text}\n\n"
+        f"USER QUESTION:\n{user_msg}"
+    )
+    return prompt
 
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.set_page_config(page_title="Anomaly + Logs + Abstract", layout="wide")
-st.title("Sensor Anomaly Detection + Log Correlation + Log Analysis + Abstract")
+st.set_page_config(page_title="Anomaly+Logs+Chat", layout="wide")
+st.title("Sensor Anomaly Detection + Log Correlation + Context Chat")
 
-# Sidebar - Groq key / init
-st.sidebar.header("Groq LLM (optional)")
-groq_key_input = st.sidebar.text_input("Paste Groq API Key (optional, for LLM abstracts)", type="password")
+# Sidebar: Groq key and controls
+st.sidebar.header("LLM (Optional) - Groq")
+groq_key_input = st.sidebar.text_input("Paste Groq API Key (optional)", type="password")
 init_llm = st.sidebar.button("Initialize Groq Client")
 
 if "groq_client" not in st.session_state:
@@ -587,7 +695,7 @@ if "groq_client" not in st.session_state:
 
 if init_llm:
     if not groq_key_input:
-        st.sidebar.error("Paste Groq API key before initialization.")
+        st.sidebar.error("Paste Groq API key first.")
     else:
         try:
             client = make_groq_client(groq_key_input)
@@ -599,7 +707,7 @@ if init_llm:
             st.session_state.groq_ready = False
             st.sidebar.error(f"Failed to init Groq client: {e}")
 
-# Sidebar - anomaly options
+# Anomaly options
 st.sidebar.header("Anomaly detection options")
 method = st.sidebar.selectbox("Method", [
     "isolation_forest","zscore","ocsvm","lof","elliptic","pca","iqr","lstm_autoencoder"
@@ -609,130 +717,156 @@ z_thresh = st.sidebar.slider("Z-score threshold", 2.0, 6.0, 3.5, step=0.1)
 z_window = st.sidebar.number_input("Z-score rolling window (0=global)", min_value=0, value=0, step=1)
 iqr_window = st.sidebar.number_input("IQR rolling window rows", min_value=5, value=48, step=1)
 lstm_seq = st.sidebar.number_input("LSTM seq length", min_value=5, value=24, step=1)
-lstm_epochs = st.sidebar.number_input("LSTM epochs", min_value=1, value=5, step=1)
+lstm_epochs = st.sidebar.number_input("LSTM epochs", min_value=1, value=3, step=1)
 
-# Layout
+# Layout: left = main, right = chat & small controls
 left, right = st.columns([3,1])
 with left:
-    st.header("Upload data")
-    sensor_file = st.file_uploader("Sensor CSV (must include numeric columns; optional 'timestamp')", type=["csv"])
-    logs_file = st.file_uploader("Operator logs CSV (must contain 'log' and optional 'timestamp')", type=["csv"])
+    st.header("Upload / Generate Data")
+    sensor_file = st.file_uploader("Sensor CSV (timestamp optional)", type=["csv"])
+    logs_file = st.file_uploader("Operator logs CSV (must include 'log' and optional 'timestamp')", type=["csv"])
 
-# State
-correlation_results: List[Dict[str,Any]] = []
-anomaly_series = None
-sensor_df = None
-logs_df = None
-log_analysis = None
+    if st.button("Generate 1-month minute-level synthetic data (and save to /mnt/data)"):
+        sensor_df_gen, logs_df_gen, paths = make_1month_sensor_and_logs()
+        st.success(f"Generated files: {paths[0]}, {paths[1]}")
+        with open(paths[0], "rb") as f:
+            st.download_button("Download generated sensor CSV", data=f, file_name=os.path.basename(paths[0]), mime="text/csv")
+        with open(paths[1], "rb") as f:
+            st.download_button("Download generated logs CSV", data=f, file_name=os.path.basename(paths[1]), mime="text/csv")
 
-# Load uploaded files
-if sensor_file:
-    try:
-        sensor_df = pd.read_csv(sensor_file)
-        if "timestamp" in sensor_df.columns:
-            try:
-                sensor_df["timestamp"] = pd.to_datetime(sensor_df["timestamp"])
-                sensor_df = sensor_df.set_index("timestamp").sort_index()
-            except Exception:
-                st.warning("Could not parse sensor timestamp column; using original index.")
-    except Exception as e:
-        st.error(f"Failed reading sensor CSV: {e}")
-        sensor_df = None
-
-if logs_file:
-    try:
-        logs_df = pd.read_csv(logs_file)
-    except Exception as e:
-        st.error(f"Failed reading logs CSV: {e}")
-        logs_df = None
-
-# Run detection & correlation
-if sensor_df is not None:
-    st.subheader("Sensor preview")
-    st.dataframe(sensor_df.head())
-
-    try:
-        if method == "isolation_forest":
-            anomaly_series = detect_anomalies_isolation(sensor_df, contamination=contamination)
-        elif method == "zscore":
-            w = int(z_window) if z_window > 0 else None
-            anomaly_series = detect_anomalies_zscore(sensor_df, z_thresh=z_thresh, window=w)
-        elif method == "ocsvm":
-            anomaly_series = detect_anomalies_ocsvm(sensor_df)
-        elif method == "lof":
-            anomaly_series = detect_anomalies_lof(sensor_df)
-        elif method == "elliptic":
-            anomaly_series = detect_anomalies_elliptic(sensor_df)
-        elif method == "pca":
-            anomaly_series = detect_anomalies_pca(sensor_df)
-        elif method == "iqr":
-            anomaly_series = detect_anomalies_iqr(sensor_df, window=int(iqr_window))
-        elif method == "lstm_autoencoder":
-            st.warning("Training LSTM Autoencoder (may be slow).")
-            anomaly_series = detect_anomalies_lstm_autoencoder(sensor_df, seq_len=int(lstm_seq), epochs=int(lstm_epochs))
-        else:
-            anomaly_series = pd.Series([False]*len(sensor_df), index=sensor_df.index)
-    except Exception as e:
-        st.error(f"Anomaly detection failed: {e}")
-        anomaly_series = pd.Series([False]*len(sensor_df), index=sensor_df.index)
-
-    st.subheader("Anomalies detected")
-    st.write("Count:", int(anomaly_series.sum()))
-
-    # Highlighted table
-    try:
-        styled = highlight_anomalies(sensor_df, anomaly_series)
-        st.subheader("Sensor table (anomalies highlighted in red)")
-        st.dataframe(styled, use_container_width=True)
-    except Exception:
-        st.write("Could not render styled table — showing anomalous rows only.")
+    # Load uploaded or generated examples if user didn't upload
+    sensor_df = None
+    logs_df = None
+    if sensor_file:
         try:
-            st.dataframe(sensor_df[anomaly_series])
-        except Exception:
-            st.write(list(np.where(anomaly_series)[0]))
-
-    # Correlate with logs if present
-    if logs_df is not None:
-        try:
-            correlation_results = correlate_anomalies_with_logs(sensor_df, logs_df, anomaly_series,
-                                                                window_minutes=30, top_matches=3)
-        except Exception as e:
-            st.error(f"Correlation failed: {e}")
-            correlation_results = []
-
-        st.subheader("Anomaly → Top matching logs")
-        if not correlation_results:
-            st.write("No results (no logs or no anomalies).")
-        else:
-            for r in correlation_results:
-                st.markdown(f"**Anomaly (pos={r['anomaly_pos']}, ts={r['timestamp']})** — signature: *{r['signature']}*")
-                if not r["matches"]:
-                    st.write("No matching logs found in window.")
-                else:
-                    for m in r["matches"]:
-                        st.write(f"- score {m['score']:.3f}: {m['text']}")
-                st.markdown("---")
-
-        # Abstract generation
-        st.subheader("Abstract / Executive Summary")
-        if st.button("Generate Abstract Summary (LLM if initialized, otherwise local)"):
-            if st.session_state.get("groq_ready") and st.session_state.get("groq_client"):
+            sensor_df = pd.read_csv(sensor_file)
+            if "timestamp" in sensor_df.columns:
                 try:
-                    client = st.session_state.groq_client
-                    llm_text = llm_abstract_from_results(client, correlation_results)
-                    st.markdown("**LLM-generated abstract:**")
-                    st.write(llm_text)
-                except Exception as e:
-                    st.error(f"LLM abstract failed: {e}")
-                    st.markdown("**Fallback local abstract:**")
-                    st.write(local_abstract_from_results(correlation_results))
-            else:
-                st.info("Groq client not initialized — using local summary.")
-                st.write(local_abstract_from_results(correlation_results))
+                    sensor_df["timestamp"] = pd.to_datetime(sensor_df["timestamp"], errors="coerce")
+                    sensor_df = sensor_df.set_index("timestamp").sort_index()
+                except Exception:
+                    pass
+        except Exception as e:
+            st.error(f"Failed reading sensor CSV: {e}")
+            sensor_df = None
     else:
-        st.info("Upload operator logs CSV to correlate anomalies and produce abstracts.")
+        example_path = "/mnt/data/sensor_pressure_1month_minute.csv"
+        if os.path.exists(example_path):
+            try:
+                tmp = pd.read_csv(example_path)
+                tmp["timestamp"] = pd.to_datetime(tmp["timestamp"], errors="coerce")
+                sensor_df = tmp.set_index("timestamp").sort_index()
+            except Exception:
+                sensor_df = None
 
-    # Log analysis panel (if logs uploaded)
+    if logs_file:
+        try:
+            logs_df = pd.read_csv(logs_file)
+        except Exception as e:
+            st.error(f"Failed reading logs CSV: {e}")
+            logs_df = None
+    else:
+        example_logs_path = "/mnt/data/operator_logs_formatted_1month.csv"
+        if os.path.exists(example_logs_path):
+            try:
+                logs_df = pd.read_csv(example_logs_path)
+            except Exception:
+                logs_df = None
+
+    # Run anomaly detection if sensor data loaded
+    correlation_results: List[Dict[str,Any]] = []
+    anomaly_series = None
+    log_analysis = None
+
+    if sensor_df is not None:
+        st.subheader("Sensor preview")
+        st.dataframe(sensor_df.head())
+
+        try:
+            if method == "isolation_forest":
+                anomaly_series = detect_anomalies_isolation(sensor_df, contamination=contamination)
+            elif method == "zscore":
+                w = int(z_window) if z_window > 0 else None
+                anomaly_series = detect_anomalies_zscore(sensor_df, z_thresh=z_thresh, window=w)
+            elif method == "ocsvm":
+                anomaly_series = detect_anomalies_ocsvm(sensor_df)
+            elif method == "lof":
+                anomaly_series = detect_anomalies_lof(sensor_df)
+            elif method == "elliptic":
+                anomaly_series = detect_anomalies_elliptic(sensor_df)
+            elif method == "pca":
+                anomaly_series = detect_anomalies_pca(sensor_df)
+            elif method == "iqr":
+                anomaly_series = detect_anomalies_iqr(sensor_df, window=int(iqr_window))
+            elif method == "lstm_autoencoder":
+                st.warning("Training LSTM Autoencoder (may be slow).")
+                anomaly_series = detect_anomalies_lstm_autoencoder(sensor_df, seq_len=int(lstm_seq), epochs=int(lstm_epochs))
+            else:
+                anomaly_series = pd.Series([False]*len(sensor_df), index=sensor_df.index)
+        except Exception as e:
+            st.error(f"Anomaly detection failed: {e}")
+            anomaly_series = pd.Series([False]*len(sensor_df), index=sensor_df.index)
+
+        st.subheader("Anomalies detected")
+        st.write("Count:", int(anomaly_series.sum()))
+
+        try:
+            styled = highlight_anomalies(sensor_df, anomaly_series)
+            st.subheader("Sensor table (anomalies highlighted in red)")
+            st.dataframe(styled, use_container_width=True)
+        except Exception:
+            st.write("Could not render styled table — showing anomalous rows only.")
+            try:
+                st.dataframe(sensor_df[anomaly_series])
+            except Exception:
+                st.write(list(np.where(anomaly_series)[0]))
+
+        if logs_df is not None:
+            try:
+                correlation_results = correlate_anomalies_with_logs(sensor_df, logs_df, anomaly_series, window_minutes=30, top_matches=3)
+            except Exception as e:
+                st.error(f"Correlation failed: {e}")
+                correlation_results = []
+
+            st.subheader("Anomaly → Top matching logs")
+            if not correlation_results:
+                st.write("No results (no logs or no anomalies).")
+            else:
+                for r in correlation_results:
+                    st.markdown(f"**Anomaly (pos={r['anomaly_pos']}, ts={r['timestamp']})** — signature: *{r['signature']}*")
+                    if not r["matches"]:
+                        st.write("No matching logs found in window.")
+                    else:
+                        for m in r["matches"]:
+                            st.write(f"- score {m['score']:.3f}: {m['text']}")
+                    st.markdown("---")
+        else:
+            st.info("Upload operator logs CSV to correlate anomalies and produce abstracts.")
+
+        # Abstract generation (local)
+        st.subheader("Abstract / Executive Summary")
+        if st.button("Generate Abstract Summary (local)"):
+            st.write(local_abstract_from_results(correlation_results))
+
+        # Downloads
+        st.subheader("Download results")
+        if sensor_df is not None:
+            st.download_button("Download sensor data (CSV)", data=df_to_csv_bytes(sensor_df.reset_index()), file_name="sensor_data_download.csv", mime="text/csv")
+        if anomaly_series is not None and sensor_df is not None:
+            try:
+                anom_df = sensor_df[anomaly_series].reset_index()
+                st.download_button("Download detected anomalies (CSV)", data=df_to_csv_bytes(anom_df), file_name="detected_anomalies.csv", mime="text/csv")
+            except Exception:
+                pass
+        if correlation_results:
+            st.download_button("Download correlation results (JSON)", data=json_to_bytes(correlation_results), file_name="correlation_results.json", mime="application/json")
+            corr_df = correlation_to_dataframe(correlation_results)
+            st.download_button("Download correlation results (CSV)", data=df_to_csv_bytes(corr_df), file_name="correlation_results.csv", mime="text/csv")
+
+    else:
+        st.info("Upload or generate sensor data to start analysis.")
+
+    # Log analysis panel
     if logs_df is not None:
         st.subheader("Log Analysis")
         try:
@@ -742,18 +876,12 @@ if sensor_df is not None:
             st.write("Top bigrams:", log_analysis["top_bigrams"][:12])
             st.text("Local summary:")
             st.text(log_analysis["local_summary"])
-
-            # Timeline plot
             if not log_analysis["timeline"].empty:
                 fig = plot_timeline(log_analysis["timeline"], title="Log events over time")
                 st.pyplot(fig)
-
-            # Top terms plot
             if log_analysis["top_unigrams"]:
                 fig2 = plot_top_terms(log_analysis["top_unigrams"][:12], title="Top unigrams")
                 st.pyplot(fig2)
-
-            # Show topical clusters examples
             if log_analysis.get("cluster_representatives") is not None and log_analysis.get("df_with_index") is not None:
                 st.markdown("**Cluster representatives:**")
                 reps = log_analysis["cluster_representatives"]
@@ -764,22 +892,27 @@ if sensor_df is not None:
                         st.write(df_idxed.iloc[idx]["log"])
                     except Exception:
                         pass
+            # downloads for log analysis
+            st.download_button("Download full log analysis (JSON)", data=json_to_bytes(log_analysis), file_name="log_analysis.json", mime="application/json")
+            if "timeline" in log_analysis and not log_analysis["timeline"].empty:
+                ts_df = log_analysis["timeline"].reset_index()
+                ts_df.columns = ["period", "count"]
+                st.download_button("Download log timeline (CSV)", data=df_to_csv_bytes(ts_df), file_name="log_timeline.csv", mime="text/csv")
+            if "most_common_cleaned" in log_analysis:
+                mc = pd.DataFrame(log_analysis["most_common_cleaned"], columns=["cleaned_text","count"])
+                st.download_button("Download most common cleaned log phrases (CSV)", data=df_to_csv_bytes(mc), file_name="log_common_phrases.csv", mime="text/csv")
         except Exception as e:
             st.error(f"Log analysis failed: {e}")
 
-else:
-    st.info("Upload a sensor CSV to start analysis.")
-
-# Chat pane (right column)
 with right:
     st.header("Chat (Direct Groq)")
     if not _HAS_GROQ:
-        st.info("Install 'langchain_groq' and 'langchain' to enable LLM chat (optional).")
+        st.info("Install 'langchain_groq' and 'langchain' to enable LLM chat.")
     else:
         if st.session_state.get("groq_ready"):
             st.success("Groq client initialized (chat ready).")
         else:
-            st.info("Paste Groq key in sidebar and click 'Initialize Groq Client' to enable chat.")
+            st.info("Paste Groq key in sidebar and click Initialize Groq Client.")
 
     user_msg = st.text_input("Chat message")
     if st.button("Send Chat Message"):
@@ -790,14 +923,22 @@ with right:
         else:
             try:
                 client = st.session_state.groq_client
-                response = llm_abstract_from_results(client, [{"timestamp":"chat","signature":"user_query","matches":[{"text":user_msg,"score":1.0}]}])
-                st.markdown("**Assistant:**")
-                st.write(response)
+                prompt = build_insightful_chat_prompt(
+                    user_msg=user_msg,
+                    sensor_df=sensor_df,
+                    logs_df=logs_df,
+                    correlation_results=correlation_results,
+                    log_analysis=log_analysis,
+                )
+                resp = client([HumanMessage(content=prompt)])
+                out = getattr(resp, "content", None)
+                if out is None:
+                    st.write(str(resp))
+                else:
+                    st.markdown("**Assistant:**")
+                    st.write(out)
             except Exception as e:
                 st.error(f"Chat failed: {e}")
 
 st.markdown("---")
-st.caption(
-    "Notes: For better semantic log matching, replace TF-IDF with embedding-based similarity (sentence-transformers). "
-    "LSTM autoencoder requires Keras/TensorFlow; if unavailable, use other detectors."
-)
+st.caption("Notes: For better semantic log matching, replace TF-IDF with embeddings. LSTM autoencoder requires Keras/TensorFlow; if unavailable, use other detectors.")
