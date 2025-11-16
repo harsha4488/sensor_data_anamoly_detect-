@@ -800,7 +800,7 @@ def build_insightful_chat_prompt(
     )
     return prompt
 
-def make_groq_client(groq_key: str, model: str="llama3-70b-8192"):
+def make_groq_client(groq_key: str, model: str="openai/gpt-oss-20b"):
     if not _HAS_GROQ:
         raise RuntimeError("langchain_groq not installed.")
     return ChatGroq(groq_api_key=groq_key, model=model)
