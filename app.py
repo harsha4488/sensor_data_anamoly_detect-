@@ -1,19 +1,25 @@
 # app.py
 """
-Streamlit app:
-- Multi-model anomaly detection (IsolationForest, Z-Score, OCSVM, LOF, Elliptic, PCA, IQR, LSTM Autoencoder)
-- Robust TF-IDF log correlation
-- Lightweight log analysis toolkit (timeline, top ngrams, topics via NMF, clustering)
-- Direct Groq LLM chat (optional — paste key in sidebar to enable)
-- Context-aware chat: LLM receives sensor/log/correlation context when answering
-- Generate & download synthetic 1-month minute-level sensor + log CSVs
-- Highlight anomaly rows in the sensor table
+Streamlit app - Full single-file application.
+
+Features:
+- Multi-model anomaly detection (IsolationForest, Z-score, OCSVM, LOF, Elliptic, PCA, IQR)
+- Optional LSTM Autoencoder (requires tensorflow/keras)
+- Log preprocessing, TF-IDF correlation, and optional SBERT embeddings correlation
+- Log analysis (top ngrams, NMF topics, timeline, clustering)
+- Optional Groq LLM chat (context-aware)
+- Generate and download 1-month synthetic minute-level sensor + logs
+- Downloadable results (CSV/JSON/TXT)
+Notes:
+- To use embeddings, install `sentence-transformers` and `torch`.
+- To use LLM features, install `langchain` and `langchain_groq` and paste a Groq key.
 """
-import json
-import io
 import os
+import io
 import re
+import json
 from typing import List, Optional, Dict, Any
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -31,7 +37,7 @@ from sklearn.decomposition import PCA, NMF
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import normalize
 
-# Optional LLM (Groq via langchain_groq)
+# Optional: Groq LLM (langchain_groq)
 _HAS_GROQ = False
 try:
     from langchain_groq import ChatGroq
@@ -40,7 +46,15 @@ try:
 except Exception:
     _HAS_GROQ = False
 
-# Keras import strategy (LSTM autoencoder optional)
+# Optional: Sentence-Transformers for embeddings
+_HAS_SBERT = False
+try:
+    from sentence_transformers import SentenceTransformer
+    _HAS_SBERT = True
+except Exception:
+    _HAS_SBERT = False
+
+# Optional: Keras/TensorFlow for LSTM autoencoder
 layers = None
 models = None
 try:
@@ -55,7 +69,7 @@ except Exception:
         models = None
 
 # -------------------------
-# Utilities
+# Basic text utilities
 # -------------------------
 def simple_tokenize(text: str) -> List[str]:
     text = str(text).lower()
@@ -138,7 +152,7 @@ def detect_anomalies_iqr(df: pd.DataFrame, window=48, factor=1.5) -> pd.Series:
         flags |= (num[col] < lower) | (num[col] > upper)
     return flags
 
-# LSTM autoencoder (optional)
+# Optional LSTM autoencoder (simple)
 def build_lstm_autoencoder(seq_len:int, nfeat:int):
     if models is None or layers is None:
         raise RuntimeError("Keras/TensorFlow not available.")
@@ -154,7 +168,7 @@ def build_lstm_autoencoder(seq_len:int, nfeat:int):
     m.compile(optimizer='adam', loss='mse')
     return m
 
-def detect_anomalies_lstm_autoencoder(df: pd.DataFrame, seq_len=24, epochs=5) -> pd.Series:
+def detect_anomalies_lstm_autoencoder(df: pd.DataFrame, seq_len=24, epochs=3) -> pd.Series:
     num = df.select_dtypes(include=[np.number]).fillna(0)
     if num.shape[1] == 0 or len(num) < seq_len + 1:
         return pd.Series([False]*len(df), index=df.index)
@@ -179,7 +193,7 @@ def detect_anomalies_lstm_autoencoder(df: pd.DataFrame, seq_len=24, epochs=5) ->
     return pd.Series(full, index=df.index)
 
 # -------------------------
-# Signature + robust correlation
+# Signature + TF-IDF correlation
 # -------------------------
 def anomaly_signature(df: pd.DataFrame, row_idx:int, top_k:int=3) -> str:
     num = df.select_dtypes(include=[np.number])
@@ -192,6 +206,9 @@ def anomaly_signature(df: pd.DataFrame, row_idx:int, top_k:int=3) -> str:
 
 def correlate_anomalies_with_logs(sensor_df: pd.DataFrame, logs_df: pd.DataFrame,
                                   anomaly_series: pd.Series, window_minutes:int=30, top_matches:int=3) -> List[Dict[str,Any]]:
+    """
+    TF-IDF / token-overlap based correlation (existing implementation).
+    """
     results: List[Dict[str,Any]] = []
     logs = logs_df.copy()
     if "timestamp" in logs.columns:
@@ -281,6 +298,165 @@ def correlate_anomalies_with_logs(sensor_df: pd.DataFrame, logs_df: pd.DataFrame
                     "score": round(score, 4)
                 })
         else:
+            sig_set = set(sig_proc.split())
+            for idx, row in window_logs.iterrows():
+                txt = row["_preproc_text"]
+                txt_set = set(txt.split())
+                if not txt_set:
+                    continue
+                overlap = len(sig_set & txt_set) / max(1, len(sig_set | txt_set))
+                if overlap > 0:
+                    matches.append({
+                        "log_index": str(idx),
+                        "timestamp": str(idx),
+                        "text": row.get("log", "")[:400],
+                        "score": round(float(overlap), 4)
+                    })
+            matches = sorted(matches, key=lambda x: -x["score"])[:top_matches]
+
+        results.append({
+            "anomaly_pos": int(pos),
+            "timestamp": str(ts),
+            "signature": signature,
+            "matches": matches
+        })
+
+    return results
+
+# -------------------------
+# Embeddings-based correlation (SBERT)
+# -------------------------
+@lru_cache(maxsize=2)
+def load_sentence_transformer(model_name: str = "all-MiniLM-L6-v2"):
+    if not _HAS_SBERT:
+        raise RuntimeError("sentence-transformers not installed.")
+    return SentenceTransformer(model_name)
+
+def compute_text_embeddings(texts: List[str], model_name: str = "all-MiniLM-L6-v2") -> np.ndarray:
+    """
+    Compute normalized embeddings for a list of texts.
+    Note: inputs are best as a list or tuple; function is used in-memory.
+    """
+    if not _HAS_SBERT:
+        raise RuntimeError("sentence-transformers not installed.")
+    model = load_sentence_transformer(model_name)
+    embs = model.encode(list(texts), show_progress_bar=False, convert_to_numpy=True)
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    embs = embs / norms
+    return embs
+
+def correlate_anomalies_with_logs_embeddings(
+    sensor_df: pd.DataFrame,
+    logs_df: pd.DataFrame,
+    anomaly_series: pd.Series,
+    window_minutes: int = 30,
+    top_matches: int = 3,
+    embed_model_name: str = "all-MiniLM-L6-v2"
+) -> List[Dict[str, Any]]:
+    """
+    Embedding-based correlation using SBERT + cosine similarity.
+    Falls back to token-overlap if embeddings are unavailable or fail.
+    """
+    results: List[Dict[str,Any]] = []
+
+    logs = logs_df.copy()
+    if "timestamp" in logs.columns:
+        try:
+            logs["timestamp"] = pd.to_datetime(logs["timestamp"], errors="coerce")
+            logs = logs.set_index("timestamp").sort_index()
+        except Exception:
+            pass
+    else:
+        try:
+            logs.index = pd.to_datetime(logs.index)
+            logs = logs.sort_index()
+        except Exception:
+            pass
+
+    if "log" not in logs.columns:
+        raise ValueError("Logs dataframe must contain a 'log' column.")
+
+    logs["_embed_text"] = logs["log"].astype(str).fillna("")
+    logs["_preproc_text"] = preprocess_text_for_tfidf(logs["log"].astype(str).tolist())
+
+    # Compute embeddings for logs if possible
+    logs_embs = None
+    try:
+        if _HAS_SBERT:
+            logs_embs = compute_text_embeddings(tuple(logs["_embed_text"].tolist()), model_name=embed_model_name)
+    except Exception:
+        logs_embs = None
+
+    # index mapping
+    index_to_pos = {}
+    for p, idx in enumerate(logs.index):
+        if idx not in index_to_pos:
+            index_to_pos[idx] = p
+
+    anomaly_positions = np.where(anomaly_series)[0]
+    sensor_idx = sensor_df.index if isinstance(sensor_df.index, pd.DatetimeIndex) else None
+
+    for pos in anomaly_positions:
+        ts = None
+        try:
+            ts = sensor_df.index[pos] if sensor_idx is not None else None
+        except Exception:
+            ts = None
+
+        signature = anomaly_signature(sensor_df, pos)
+        sig_proc = " ".join(simple_tokenize(signature))
+
+        if ts is not None and isinstance(logs.index, pd.DatetimeIndex):
+            start = ts - pd.Timedelta(minutes=window_minutes)
+            end = ts + pd.Timedelta(minutes=window_minutes)
+            try:
+                window_logs = logs.loc[start:end]
+            except Exception:
+                window_logs = logs
+        else:
+            window_logs = logs
+
+        if window_logs.empty:
+            results.append({
+                "anomaly_pos": int(pos),
+                "timestamp": str(ts),
+                "signature": signature,
+                "matches": []
+            })
+            continue
+
+        # Determine window positions
+        window_positions = []
+        for idx in window_logs.index:
+            p = index_to_pos.get(idx, None)
+            if p is not None:
+                window_positions.append(p)
+
+        matches = []
+        if logs_embs is not None and len(window_positions) > 0:
+            try:
+                sig_emb = compute_text_embeddings((sig_proc,), model_name=embed_model_name)[0]
+                candidate_embs = logs_embs[window_positions]
+                sims = candidate_embs.dot(sig_emb)  # cosine because normalized
+                ranked = np.argsort(-sims)[:top_matches]
+                for r in ranked:
+                    score = float(sims[r])
+                    if score <= 0:
+                        continue
+                    gp = window_positions[r]
+                    matches.append({
+                        "log_pos": int(gp),
+                        "log_index": str(logs.index[gp]),
+                        "timestamp": str(logs.index[gp]),
+                        "text": logs["log"].iloc[gp],
+                        "score": round(score, 4)
+                    })
+            except Exception:
+                logs_embs = None  # fallback to token-overlap below
+
+        if not matches:
+            # fallback token overlap
             sig_set = set(sig_proc.split())
             for idx, row in window_logs.iterrows():
                 txt = row["_preproc_text"]
@@ -450,7 +626,7 @@ def analyze_logs(logs_df, text_col="log", ts_candidates=("timestamp","time","ts"
     return out
 
 # -------------------------
-# Plot helpers (matplotlib)
+# Plot helpers
 # -------------------------
 def plot_timeline(timeline_series, title="Events over time", figsize=(8,3)):
     fig, ax = plt.subplots(figsize=figsize)
@@ -473,62 +649,7 @@ def plot_top_terms(top_terms, title="Top terms", figsize=(6,3)):
     return fig
 
 # -------------------------
-# Abstract generation helpers
-# -------------------------
-def local_abstract_from_results(correlation_results: List[Dict[str,Any]]) -> str:
-    if not correlation_results:
-        return "No correlation results to summarize."
-    total = len(correlation_results)
-    matched = sum(1 for r in correlation_results if r.get("matches"))
-    lines = []
-    lines.append(f"Executive summary: {total} anomalies analyzed, {matched} had at least one matching log entry.")
-    theme_counts = {}
-    for r in correlation_results:
-        sig = r.get("signature","")
-        theme_counts[sig] = theme_counts.get(sig,0) + 1
-    top_themes = sorted(theme_counts.items(), key=lambda x:-x[1])[:5]
-    if top_themes:
-        lines.append("Top anomaly signatures:")
-        for s,c in top_themes:
-            lines.append(f"- {s} ({c} occurrences)")
-    lines.append("Anomaly hypotheses (short):")
-    for r in correlation_results:
-        ts = r.get("timestamp","?")
-        sig = r.get("signature","")
-        if r.get("matches"):
-            top = r["matches"][0]
-            snippet = (top.get("text","")[:120]).replace("\n"," ")
-            lines.append(f"- {ts}: signature={sig} → likely related to log: \"{snippet}\" (score {top.get('score',0):.3f})")
-        else:
-            lines.append(f"- {ts}: signature={sig} → no log matches found in window.")
-    lines.append("Recommended next steps:")
-    lines.append("1. Inspect sensors in top signatures and cross-check maintenance logs.")
-    lines.append("2. If repeated, schedule focused telemetry & manual inspection.")
-    lines.append("3. Consider embedding-based log matching for deeper semantic matches.")
-    return "\n".join(lines)
-
-def llm_abstract_from_results(client, correlation_results: List[Dict[str,Any]]) -> str:
-    compact = json.dumps(correlation_results, indent=2)[:16000]
-    prompt = (
-        "You are an expert industrial data scientist. Produce:\n"
-        "1) EXECUTIVE SUMMARY (3–5 sentences)\n"
-        "2) For each anomaly provide a 1-line root-cause hypothesis linking sensor signature to matched logs (if any)\n"
-        "3) Prioritized next investigative steps (3 items)\n\n"
-        "Input JSON:\n" + compact
-    )
-    resp = client([HumanMessage(content=prompt)])
-    out = getattr(resp, "content", None)
-    if out is None:
-        return str(resp)
-    return out
-
-def make_groq_client(groq_key: str, model: str="llama3-70b-8192"):
-    if not _HAS_GROQ:
-        raise RuntimeError("langchain_groq not installed.")
-    return ChatGroq(groq_api_key=groq_key, model=model)
-
-# -------------------------
-# File generation helpers & downloads
+# Downloads & helpers
 # -------------------------
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     buf = io.StringIO()
@@ -563,6 +684,9 @@ def correlation_to_dataframe(corr_results: List[Dict[str,Any]]) -> pd.DataFrame:
                 }})
     return pd.DataFrame(rows)
 
+# -------------------------
+# Synthetic data generation
+# -------------------------
 def make_1month_sensor_and_logs(start_ts="2025-01-01 00:00:00", days=30,
                                 out_sensor_path="/mnt/data/sensor_pressure_1month_minute.csv",
                                 out_logs_path="/mnt/data/operator_logs_formatted_1month.csv",
@@ -634,9 +758,7 @@ def build_insightful_chat_prompt(
     context_parts = []
     if sensor_df is not None:
         try:
-            context_parts.append(
-                f"Sensor dataframe shape: {sensor_df.shape}, columns: {list(sensor_df.columns)}"
-            )
+            context_parts.append(f"Sensor dataframe shape: {sensor_df.shape}, columns: {list(sensor_df.columns)}")
             try:
                 sample_head = sensor_df.head(3).reset_index().to_dict(orient="records")
                 context_parts.append("Sensor sample rows: " + json.dumps(sample_head, default=str))
@@ -678,13 +800,18 @@ def build_insightful_chat_prompt(
     )
     return prompt
 
+def make_groq_client(groq_key: str, model: str="llama3-70b-8192"):
+    if not _HAS_GROQ:
+        raise RuntimeError("langchain_groq not installed.")
+    return ChatGroq(groq_api_key=groq_key, model=model)
+
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.set_page_config(page_title="Anomaly+Logs+Chat", layout="wide")
-st.title("Sensor Anomaly Detection + Log Correlation + Context Chat")
+st.set_page_config(page_title="Anomaly+Logs+Embeddings+Chat", layout="wide")
+st.title("Sensor Anomaly Detection + Log Correlation + Embeddings + Chat")
 
-# Sidebar: Groq key and controls
+# Sidebar controls
 st.sidebar.header("LLM (Optional) - Groq")
 groq_key_input = st.sidebar.text_input("Paste Groq API Key (optional)", type="password")
 init_llm = st.sidebar.button("Initialize Groq Client")
@@ -707,7 +834,6 @@ if init_llm:
             st.session_state.groq_ready = False
             st.sidebar.error(f"Failed to init Groq client: {e}")
 
-# Anomaly options
 st.sidebar.header("Anomaly detection options")
 method = st.sidebar.selectbox("Method", [
     "isolation_forest","zscore","ocsvm","lof","elliptic","pca","iqr","lstm_autoencoder"
@@ -719,7 +845,11 @@ iqr_window = st.sidebar.number_input("IQR rolling window rows", min_value=5, val
 lstm_seq = st.sidebar.number_input("LSTM seq length", min_value=5, value=24, step=1)
 lstm_epochs = st.sidebar.number_input("LSTM epochs", min_value=1, value=3, step=1)
 
-# Layout: left = main, right = chat & small controls
+st.sidebar.header("Log correlation options")
+correlation_method = st.sidebar.selectbox("Correlation method", ["tfidf", "embeddings"])
+embed_model_name = st.sidebar.text_input("Embedding model name (SBERT)", value="all-MiniLM-L6-v2")
+
+# Layout
 left, right = st.columns([3,1])
 with left:
     st.header("Upload / Generate Data")
@@ -734,7 +864,7 @@ with left:
         with open(paths[1], "rb") as f:
             st.download_button("Download generated logs CSV", data=f, file_name=os.path.basename(paths[1]), mime="text/csv")
 
-    # Load uploaded or generated examples if user didn't upload
+    # Load data (uploaded or example)
     sensor_df = None
     logs_df = None
     if sensor_file:
@@ -773,7 +903,7 @@ with left:
             except Exception:
                 logs_df = None
 
-    # Run anomaly detection if sensor data loaded
+    # Run detectors & correlation
     correlation_results: List[Dict[str,Any]] = []
     anomaly_series = None
     log_analysis = None
@@ -821,9 +951,19 @@ with left:
             except Exception:
                 st.write(list(np.where(anomaly_series)[0]))
 
+        # Correlate with logs if available
         if logs_df is not None:
             try:
-                correlation_results = correlate_anomalies_with_logs(sensor_df, logs_df, anomaly_series, window_minutes=30, top_matches=3)
+                if correlation_method == "embeddings":
+                    correlation_results = correlate_anomalies_with_logs_embeddings(
+                        sensor_df, logs_df, anomaly_series,
+                        window_minutes=30, top_matches=3, embed_model_name=embed_model_name
+                    )
+                else:
+                    correlation_results = correlate_anomalies_with_logs(
+                        sensor_df, logs_df, anomaly_series,
+                        window_minutes=30, top_matches=3
+                    )
             except Exception as e:
                 st.error(f"Correlation failed: {e}")
                 correlation_results = []
@@ -892,7 +1032,6 @@ with left:
                         st.write(df_idxed.iloc[idx]["log"])
                     except Exception:
                         pass
-            # downloads for log analysis
             st.download_button("Download full log analysis (JSON)", data=json_to_bytes(log_analysis), file_name="log_analysis.json", mime="application/json")
             if "timeline" in log_analysis and not log_analysis["timeline"].empty:
                 ts_df = log_analysis["timeline"].reset_index()
@@ -941,4 +1080,4 @@ with right:
                 st.error(f"Chat failed: {e}")
 
 st.markdown("---")
-st.caption("Notes: For better semantic log matching, replace TF-IDF with embeddings. LSTM autoencoder requires Keras/TensorFlow; if unavailable, use other detectors.")
+st.caption("Notes: For embeddings, install sentence-transformers and torch. For LSTM autoencoder install tensorflow/keras. For Groq LLM install langchain and langchain_groq.")
